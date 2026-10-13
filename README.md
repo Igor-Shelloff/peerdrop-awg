@@ -98,7 +98,7 @@ go mod tidy
 $env:GOOS="windows"
 $env:GOARCH="amd64"
 $env:CGO_ENABLED="0"
-go build -tags ci -ldflags="-H windowsgui -s -w" -o peerdrop-awg.exe .
+go build -ldflags="-H windowsgui -s -w" -o peerdrop-awg.exe .
 ```
 
 Place `wintun.dll` next to `peerdrop-awg.exe` and run as administrator.
