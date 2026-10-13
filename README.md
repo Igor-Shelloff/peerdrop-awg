@@ -13,7 +13,7 @@ Transfer files and secrets directly between computers — no cloud, no third-par
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
 [![Version](https://img.shields.io/badge/Version-1.0.0-blue)]()
 
-[Features](#-features) • [Installation](#-installation) • [Usage](#-usage) • [FAQ](#-faq) • [Support](#-support-the-project)
+[Features](#-features) • [Installation](#-installation) • [Usage](#-usage) • [Security](#-security-model) • [FAQ](#-faq) • [Support](#-support-the-project)
 
 </div>
 
@@ -26,11 +26,11 @@ Transfer files and secrets directly between computers — no cloud, no third-par
 Perfect for:
 
 - **Large file transfers** — videos, archives, anything — no size limits, no upload throttling
-- **Secret sharing** — send passwords, API keys or one-time codes with auto-erase after reading
+- **Secret sharing** — send passwords, API keys or one-time codes that are not written to disk
 - **Cross-network transfers** — between home, office, or different countries, even behind strict NAT
 - **DPI bypass** — AmneziaWG obfuscation protects against deep packet inspection
 
-The app talks to your VPS only during the initial deployment. After that, files travel **directly between peers** over an encrypted VPN tunnel — the VPS never sees the content.
+The app talks to your VPS only during the initial deployment. After that, files travel directly between peers over an encrypted VPN tunnel.
 
 ---
 
@@ -41,11 +41,10 @@ The app talks to your VPS only during the initial deployment. After that, files 
 - 🔐 **Encrypted invite tokens** — share access without revealing server credentials (optional PIN protection)
 - 👥 **Peer discovery** — automatic detection of online users in the VPN network
 - 📤 **File transfer** — send any file with progress bar and recipient confirmation
-- 🔒 **Secret sharing** — send passwords or keys that are **never saved to disk** by default; recipient copies and the window closes
-- ⚙️ **Read-once secrets** — optional flag allows recipient to save as `.txt` only if sender permits
+- 🔒 **Secret sharing** — send passwords or keys that are **not written to disk** by default; recipient copies and the window closes
+- ⚙️ **Optional saving** — sender can allow the recipient to save the secret as a `.txt` file
 - 🏷️ **Friendly names** — assign nicknames when creating clients; they appear in the peer list
 - 📜 **Built-in event log** — see exactly what's happening during deployment and transfers
-- 🌍 **No central server** — files travel directly between peers
 - 🆓 **Free & open source** — no license keys, no subscriptions
 
 ---
@@ -99,7 +98,7 @@ go mod tidy
 $env:GOOS="windows"
 $env:GOARCH="amd64"
 $env:CGO_ENABLED="0"
-go build -ldflags="-H windowsgui -s -w" -o peerdrop-awg.exe . 
+go build -tags ci -ldflags="-H windowsgui -s -w" -o peerdrop-awg.exe .
 ```
 
 Place `wintun.dll` next to `peerdrop-awg.exe` and run as administrator.
@@ -140,7 +139,42 @@ Place `wintun.dll` next to `peerdrop-awg.exe` and run as administrator.
 2. Go to the **Send** tab
 3. Select the recipient from the **To:** dropdown
 4. **File:** choose a file → click **Send file**. Recipient confirms, file saves to `~/Downloads/PeerDrop`
-5. **Secret:** enter a title and content → optionally check *Allow recipient to save as .txt* → click **Send secret**. By default the secret appears in a popup on the recipient's side with a **Copy** button; closing the popup erases it from memory
+5. **Secret:** enter a title and content → optionally check *Allow recipient to save as .txt* → click **Send secret**. By default the secret appears in a popup on the recipient's side with a **Copy** button; closing the popup removes it from the app's state
+
+---
+
+## 🔐 Security Model
+
+We want to be honest about what PeerDrop AWG protects against and what it doesn't. **Read this before sending anything sensitive.**
+
+### What is protected
+
+- **Traffic between each peer and the VPS** is encrypted and obfuscated by AmneziaWG. An outside observer (ISP, DPI) cannot see file contents or even recognize the traffic as a VPN.
+- **Invite tokens** can be optionally encrypted with a PIN (AES-256-GCM + PBKDF2). Without the PIN, a leaked token is useless.
+- **Config files** are written with `0600` permissions on Unix-like systems and stored per-user on Windows.
+- **Secrets** are not written to disk by default — they are shown once with a Copy button.
+
+### What is **not** protected
+
+- **The VPS sees decrypted traffic between peers.** In the standard hub-and-spoke WireGuard setup, the VPS terminates the VPN tunnels. If peer A sends a file to peer B, the packet passes through the VPS in decrypted form. **Do not use a VPS you don't trust** for sensitive transfers.
+- **No end-to-end encryption between peers.** PeerDrop AWG does not add an extra layer of encryption on top of WireGuard. The TCP traffic between peers is only as private as the VPN itself.
+- **Read-once secrets are not securely wiped from memory.** Go uses a garbage collector and immutable strings — copies of the secret may remain in RAM until the process exits. When you click **Copy**, the secret also goes into the OS clipboard, which is visible to other applications and may persist until overwritten.
+- **Received files can overwrite existing files with the same name** in `~/Downloads/PeerDrop`. This will be fixed in a future version.
+
+### Recommendations
+
+- ✅ Safe for: family photos, videos, large archives, non-critical documents
+- ⚠️ Use with caution: internal team files, source code, business documents
+- ❌ Do not use for: passwords, private keys, financial data, medical records — **unless you fully control the VPS and trust the network path**
+
+### Future work
+
+The following improvements are planned or under consideration:
+
+- End-to-end encryption between peers (ChaCha20-Poly1305 with per-peer key exchange)
+- Auto-rename received files on conflict instead of overwriting
+- Auto-clear clipboard after a short timeout
+- Optional binding of the TCP listener to the VPN interface only
 
 ---
 
@@ -154,18 +188,16 @@ Place `wintun.dll` next to `peerdrop-awg.exe` and run as administrator.
 │             │ deploy  │  10.x.x.1/24     │  VPN    │             │
 └─────────────┘         └──────────────────┘         └─────────────┘
        ▲                                                    ▲
-       │                   Direct VPN tunnel                │
+       │                   VPN tunnel                       │
        └────────────────────────────────────────────────────┘
-                    (encrypted, DPI-resistant)
+                    (encrypted peer ↔ VPS ↔ peer)
 ```
 
 1. The host uses SSH to deploy AmneziaWG on a VPS
 2. Each peer receives a client config (as an invite token) and connects to the VPN
 3. All peers join a virtual LAN (e.g., `10.9.9.0/24`)
 4. Peer discovery uses UDP unicast sweep across the subnet
-5. File/secret transfer uses TCP directly between peers
-
-**No central server ever sees your files.** The VPS only routes encrypted WireGuard packets.
+5. File/secret transfer uses TCP directly between peers, routed by the VPS
 
 ---
 
@@ -175,7 +207,10 @@ Place `wintun.dll` next to `peerdrop-awg.exe` and run as administrator.
 Only the host needs a VPS. Clients just need the invite token.
 
 **Q: Is this really peer-to-peer?**
-Yes. Files travel directly between peers over the VPN tunnel. The VPS is just a relay for the initial connection.
+For discovery and transfer logic — yes, peers address each other directly. For the network path — traffic is routed through the VPS because it's a hub-and-spoke VPN. If the VPS is compromised, traffic between peers is visible to it.
+
+**Q: Can the VPS owner read my files?**
+In the current version — technically yes, if they inspect the decrypted traffic on the VPN interface. This is a known limitation. Do not use a VPS you don't fully trust for sensitive data.
 
 **Q: What if DPI blocks WireGuard?**
 AmneziaWG uses obfuscation (fake DNS packets, header randomization) specifically to bypass DPI. That's why we chose it over standard WireGuard.
