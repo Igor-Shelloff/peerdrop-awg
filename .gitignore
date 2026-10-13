@@ -1,0 +1,27 @@
+# Binaries
+peerdrop-awg.exe
+peerdrop-debug.exe
+*.exe
+*.dll
+
+# Build artifacts
+/dist/
+/build/
+/release/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Go
+go.work
+go.sum.lock
