@@ -8,7 +8,6 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/melbahja/goph/v2 v2.0.3
 	golang.org/x/crypto v0.58.0
-	golang.org/x/sys v0.49.0
 )
 
 require (
@@ -45,6 +44,7 @@ require (
 	github.com/yuin/goldmark v1.8.2 // indirect
 	golang.org/x/image v0.24.0 // indirect
 	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

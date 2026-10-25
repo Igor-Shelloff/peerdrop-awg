@@ -2,18 +2,27 @@ package ssh
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/melbahja/goph/v2"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 const (
-	manageScript = "/root/awg/manage_amneziawg.sh"
-	clientDir    = "/root/awg"
-	installerURL = "https://raw.githubusercontent.com/bivlked/amneziawg-installer/main/install_amneziawg.sh"
+	manageScript    = "/root/awg/manage_amneziawg.sh"
+	clientDir       = "/root/awg"
+	installerURL    = "https://raw.githubusercontent.com/bivlked/amneziawg-installer/3eb63f153b549b3b1820bb2ff545ac0c783710aa/install_amneziawg.sh"
+	installerSHA256 = "E0024185E686B1B8292EA96CBF5D315EF4CADB1ED29BB46FF1AFF41DBD7604D2"
 )
+
+type HostKeyPrompt func(host, fingerprint string) bool
 
 type Deployer struct {
 	host     string
@@ -24,7 +33,22 @@ type Deployer struct {
 	log      func(string)
 }
 
-func NewDeployer(host, port, user, password string, logFn func(string)) (*Deployer, error) {
+func knownHostsPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "peerdrop_known_hosts"
+	}
+	return filepath.Join(dir, "PeerDrop", "known_hosts")
+}
+
+func hostPattern(host, port string) string {
+	if port == "" || port == "22" {
+		return host
+	}
+	return host + ":" + port
+}
+
+func NewDeployer(host, port, user, password string, prompt HostKeyPrompt, logFn func(string)) (*Deployer, error) {
 	d := &Deployer{
 		host:     host,
 		port:     port,
@@ -32,23 +56,96 @@ func NewDeployer(host, port, user, password string, logFn func(string)) (*Deploy
 		password: password,
 		log:      logFn,
 	}
+	if err := d.ensureHostKeyKnown(prompt); err != nil {
+		return nil, err
+	}
 	if err := d.connect(); err != nil {
 		return nil, err
 	}
 	return d, nil
 }
 
+func (d *Deployer) ensureHostKeyKnown(prompt HostKeyPrompt) error {
+	path := knownHostsPath()
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+
+	cb, err := knownhosts.New(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("known_hosts: %w", err)
+		}
+		cb = nil
+	}
+
+	capturedKey := captureHostKey(d.host, d.port)
+	if capturedKey == nil {
+		return fmt.Errorf("could not obtain SSH host key from %s:%s", d.host, d.port)
+	}
+
+	if cb != nil {
+		lookup := net.JoinHostPort(d.host, d.port)
+		if err := cb(lookup, &net.TCPAddr{}, capturedKey); err == nil {
+			return nil
+		} else {
+			var keyErr *knownhosts.KeyError
+			if errors.As(err, &keyErr) && len(keyErr.Want) > 0 {
+				return fmt.Errorf("HOST KEY MISMATCH for %s — possible MITM!\nExpected: %v\nGot: %s",
+					d.host, keyErr.Want, ssh.FingerprintSHA256(capturedKey))
+			}
+		}
+	}
+
+	fp := ssh.FingerprintSHA256(capturedKey)
+	if prompt != nil && !prompt(d.host, fp) {
+		return errors.New("host key rejected by user")
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open known_hosts: %w", err)
+	}
+	defer f.Close()
+	line := knownhosts.Line([]string{hostPattern(d.host, d.port)}, capturedKey)
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		return fmt.Errorf("write known_hosts: %w", err)
+	}
+	return nil
+}
+
+func captureHostKey(host, port string) ssh.PublicKey {
+	if port == "" {
+		port = "22"
+	}
+	var key ssh.PublicKey
+	cfg := &ssh.ClientConfig{
+		HostKeyCallback: func(_ string, _ net.Addr, k ssh.PublicKey) error {
+			key = k
+			return errors.New("captured")
+		},
+		Timeout: 10 * time.Second,
+	}
+	conn, err := ssh.Dial("tcp", net.JoinHostPort(host, port), cfg)
+	if err != nil && key != nil {
+		return key
+	}
+	if conn != nil {
+		conn.Close()
+	}
+	return key
+}
+
 func (d *Deployer) connect() error {
 	if d.port == "" {
 		d.port = "22"
 	}
-	addr := d.host
-	if d.port != "22" {
-		addr = fmt.Sprintf("%s:%s", d.host, d.port)
-	}
-	c, err := goph.New(d.user, addr,
+	addr := net.JoinHostPort(d.host, d.port)
+
+	c, err := goph.New(
+		d.user,
+		d.host,
 		goph.WithPassword(d.password),
-		goph.WithInsecureIgnoreHostKey(),
+		goph.WithPort(parsePort(d.port)),
+		goph.WithKnownHosts(knownHostsPath()),
 	)
 	if err != nil {
 		return fmt.Errorf("SSH %s: %w", addr, err)
@@ -56,6 +153,15 @@ func (d *Deployer) connect() error {
 	d.client = c
 	d.log("SSH connected: " + addr)
 	return nil
+}
+
+func parsePort(p string) uint {
+	var n uint
+	fmt.Sscanf(p, "%d", &n)
+	if n == 0 {
+		return 22
+	}
+	return n
 }
 
 func (d *Deployer) hardReconnect() {
@@ -99,20 +205,28 @@ func (d *Deployer) waitUntilReady(ctx context.Context, timeout time.Duration) er
 }
 
 func (d *Deployer) runInstaller(ctx context.Context) (bool, error) {
+	if len(installerSHA256) != 64 {
+		return false, fmt.Errorf("installer SHA256 not configured: set installerSHA256 in deploy.go to sha256 of %s", installerURL)
+	}
+
 	script := `
-set -e
+set -eo pipefail
 cd /root
-if [ ! -f install_amneziawg.sh ]; then
-  curl -fsSL -o install_amneziawg.sh ` + installerURL + `
-  chmod +x install_amneziawg.sh
-fi
+curl -fsSL -o install_amneziawg.sh ` + installerURL + `
+echo "` + installerSHA256 + `  install_amneziawg.sh" | sha256sum -c - || {
+  echo "INTEGRITY CHECK FAILED" >&2
+  rm -f install_amneziawg.sh
+  exit 1
+}
+chmod +x install_amneziawg.sh
 sudo ./install_amneziawg.sh --yes --protocol=2.0 --isolation=off < /dev/null 2>&1 | tee -a /root/awg_deploy.log
 `
-	d.log("Running installer (--isolation=off, clients will not be isolated)…")
+	d.log("Running installer (verified by SHA-256)…")
 	out, err := d.rawRun(script, 25*time.Minute)
 	if err != nil {
 		if looksLikeConnectionLoss(err) {
 			d.log("Connection dropped — server is likely rebooting")
+			d.hardReconnect()
 			return false, nil
 		}
 		return false, fmt.Errorf("installer failed: %w\n--- output ---\n%s", err, out)
@@ -121,15 +235,19 @@ sudo ./install_amneziawg.sh --yes --protocol=2.0 --isolation=off < /dev/null 2>&
 }
 
 func (d *Deployer) InstallAmneziaWG(ctx context.Context) error {
-	if _, err := d.runInstaller(ctx); err != nil {
+	completed, err := d.runInstaller(ctx)
+	if err != nil {
 		return err
+	}
+	if !completed && d.client == nil {
+		if err := d.waitUntilReady(ctx, 5*time.Minute); err != nil {
+			return fmt.Errorf("waiting for first reboot: %w", err)
+		}
+		time.Sleep(10 * time.Second)
 	}
 
 	deadline := time.Now().Add(30 * time.Minute)
-	iteration := 0
-
 	for time.Now().Before(deadline) {
-		iteration++
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -159,11 +277,12 @@ func (d *Deployer) InstallAmneziaWG(ctx context.Context) error {
 
 		state, _ := d.rawRun("cat /root/awg/setup_state 2>/dev/null || echo missing", 10*time.Second)
 		state = strings.TrimSpace(state)
-		d.log(fmt.Sprintf("Service inactive (state=%s, iteration %d)", state, iteration))
+		d.log("Service inactive (state=" + state + ")")
 
 		if d.client != nil {
 			d.log("Re-running installer to continue…")
-			if _, err := d.runInstaller(ctx); err != nil {
+			_, err := d.runInstaller(ctx)
+			if err != nil {
 				return err
 			}
 		}

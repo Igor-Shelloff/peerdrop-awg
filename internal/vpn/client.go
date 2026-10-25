@@ -4,10 +4,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"net"
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
@@ -19,8 +20,15 @@ import (
 type Client struct {
 	TunName string
 	Cfg     *wgconfig.ClientConfig
+	LogFn   func(string)
 	dev     *device.Device
 	tun     tun.Device
+}
+
+func (c *Client) logf(format string, args ...interface{}) {
+	if c.LogFn != nil {
+		c.LogFn(fmt.Sprintf(format, args...))
+	}
 }
 
 func (c *Client) Start() error {
@@ -48,15 +56,13 @@ func (c *Client) Start() error {
 	if err != nil {
 		return fmt.Errorf("tun name: %w", err)
 	}
-	log.Printf("TUN created: %q", realName)
+	c.logf("TUN created: %q", realName)
 
 	logger := device.NewLogger(device.LogLevelError, "[awg] ")
 	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), logger)
 	c.dev = dev
 
 	uapi := c.Cfg.UAPI(privHex, pubHex)
-	log.Printf("UAPI:\n%s", uapi)
-
 	if err := dev.IpcSet(uapi); err != nil {
 		dev.Close()
 		_ = tunDev.Close()
@@ -68,12 +74,20 @@ func (c *Client) Start() error {
 		return fmt.Errorf("device up: %w", err)
 	}
 
-	if err := configureInterface(realName, c.Cfg.ClientIP(), mtu); err != nil {
+	// Исправленная строка здесь:
+	if err := configureInterface(realName, c.Cfg.ClientIP(), mtu, func(s string) { c.logf("%s", s) }); err != nil {
 		dev.Close()
 		_ = tunDev.Close()
 		return fmt.Errorf("configure: %w", err)
 	}
-	log.Printf("Interface %q: %s", realName, c.Cfg.ClientIP())
+
+	if err := waitForIPBindable(c.Cfg.ClientIP(), 20*time.Second); err != nil {
+		dev.Close()
+		_ = tunDev.Close()
+		return fmt.Errorf("wait for IP: %w", err)
+	}
+
+	c.logf("Interface %q ready: %s", realName, c.Cfg.ClientIP())
 	return nil
 }
 
@@ -87,13 +101,70 @@ func (c *Client) Stop() error {
 	return nil
 }
 
-func configureInterface(name, ip string, mtu int) error {
+func waitForIPBindable(ip string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	addr := net.JoinHostPort(ip, "0")
+	var lastErr error
+	attempts := 0
+	for time.Now().Before(deadline) {
+		attempts++
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			_ = ln.Close()
+			return nil
+		}
+		lastErr = err
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("IP %s not bindable after %s (attempts=%d): %v", ip, timeout, attempts, lastErr)
+}
+
+func configureInterface(name, ip string, mtu int, logFn func(string)) error {
 	switch runtime.GOOS {
 	case "windows":
-		if out, err := exec.Command("netsh", "interface", "ip", "set", "address",
-			"name="+name, "static", ip, "255.255.255.0").CombinedOutput(); err != nil {
-			return fmt.Errorf("netsh set address: %v: %s", err, out)
+		out, err := exec.Command("netsh", "interface", "ipv4", "set", "address",
+			"name="+name, "static", ip, "255.255.255.0").CombinedOutput()
+		if err != nil {
+			out2, err2 := exec.Command("netsh", "interface", "ip", "set", "address",
+				"name="+name, "static", ip, "255.255.255.0").CombinedOutput()
+			if err2 != nil {
+				return fmt.Errorf("netsh set address failed.\n  ipv4: %v: %s\n  legacy: %v: %s",
+					err, strings.TrimSpace(string(out)),
+					err2, strings.TrimSpace(string(out2)))
+			}
 		}
+
+		deadline := time.Now().Add(10 * time.Second)
+		found := false
+		for time.Now().Before(deadline) {
+			addrs, err := net.InterfaceAddrs()
+			if err == nil {
+				for _, addr := range addrs {
+					if ipnet, ok := addr.(*net.IPNet); ok {
+						if ipnet.IP.String() == ip {
+							found = true
+							break
+						}
+					}
+				}
+			}
+			if found {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		if !found {
+			showOut, _ := exec.Command("netsh", "interface", "ipv4", "show", "addresses",
+				"name="+name).CombinedOutput()
+			return fmt.Errorf("netsh completed, but IP %s was not applied to %q.\nOutput:\n%s",
+				ip, name, strings.TrimSpace(string(showOut)))
+		}
+
+		if logFn != nil {
+			logFn(fmt.Sprintf("netsh: IP %s set on %q", ip, name))
+		}
+
 		if mtu > 0 {
 			_ = exec.Command("netsh", "interface", "ipv4", "set", "subinterface",
 				name, fmt.Sprintf("mtu=%d", mtu), "store=persistent").Run()

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +20,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"github.com/google/uuid"
 
+	"peerdrop-awg/internal/e2e"
 	"peerdrop-awg/internal/peers"
 	"peerdrop-awg/internal/ssh"
 	"peerdrop-awg/internal/token"
@@ -69,10 +69,12 @@ type App struct {
 	tokenPINEntry *widget.Entry
 	applyTokenBtn *widget.Button
 
-	peersList   *widget.List
-	peerItems   []peers.Peer
-	refreshBtn  *widget.Button
-	myInfoLabel *widget.Label
+	peersList         *widget.List
+	peerItems         []peers.Peer
+	selectedPeerIndex int
+	refreshBtn        *widget.Button
+	forgetBtn         *widget.Button
+	myInfoLabel       *widget.Label
 
 	peerSelect  *widget.Select
 	peerByLabel map[string]peers.Peer
@@ -100,6 +102,8 @@ type App struct {
 	server     *transfer.Server
 	myID       string
 	myName     string
+	e2eKeys    *e2e.KeyPair
+	knownPeers *e2e.KnownPeers
 }
 
 func NewApp() *App {
@@ -110,6 +114,19 @@ func NewApp() *App {
 
 	a.myID = loadOrCreateID()
 	a.role = loadOrDetectRole()
+	a.selectedPeerIndex = -1
+
+	kp, err := e2e.LoadOrCreate(e2eKeysPath())
+	if err != nil {
+		kp, _ = e2e.Generate()
+	}
+	a.e2eKeys = kp
+
+	kps, err := e2e.LoadKnownPeers(knownPeersPath())
+	if err != nil {
+		kps, _ = e2e.LoadKnownPeers(filepath.Join(os.TempDir(), "peerdrop-known-peers.json"))
+	}
+	a.knownPeers = kps
 
 	a.buildUI()
 
@@ -131,6 +148,22 @@ func NewApp() *App {
 		a.setStatus("Ready")
 	}
 	return a
+}
+
+func e2eKeysPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "peerdrop-e2e-keys.json"
+	}
+	return filepath.Join(dir, "PeerDrop", "e2e_keys.json")
+}
+
+func knownPeersPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "peerdrop-known-peers.json"
+	}
+	return filepath.Join(dir, "PeerDrop", "known_peers.json")
 }
 
 func rolePath() string {
@@ -304,6 +337,7 @@ func (a *App) buildUI() {
 	})
 
 	a.log("PeerDrop AWG started. Role: " + a.role)
+	a.log("E2E identity: " + a.e2eKeys.Fingerprint())
 }
 
 func (a *App) buildHostPanel() *fyne.Container {
@@ -422,6 +456,8 @@ func (a *App) buildPeersTab() fyne.CanvasObject {
 				widget.NewLabelWithStyle("template-name",
 					fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 				widget.NewLabel("template-ip"),
+				layout.NewSpacer(),
+				widget.NewLabelWithStyle("fingerprint", fyne.TextAlignTrailing, fyne.TextStyle{Monospace: true}),
 			)
 		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
@@ -432,18 +468,43 @@ func (a *App) buildPeersTab() fyne.CanvasObject {
 			box := o.(*fyne.Container)
 			box.Objects[1].(*widget.Label).SetText(p.Name)
 			box.Objects[2].(*widget.Label).SetText(fmt.Sprintf("(%s)", p.IP))
+			box.Objects[4].(*widget.Label).SetText(e2e.Fingerprint(p.SignPub))
 		},
 	)
+
+	a.peersList.OnSelected = func(id widget.ListItemID) {
+		a.selectedPeerIndex = id
+	}
+	a.peersList.OnUnselected = func(id widget.ListItemID) {
+		if a.selectedPeerIndex == id {
+			a.selectedPeerIndex = -1
+		}
+	}
 
 	a.refreshBtn = widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
 		a.updatePeersUI()
 	})
 	a.refreshBtn.Importance = widget.LowImportance
 
+	a.forgetBtn = widget.NewButtonWithIcon("Forget peer", theme.DeleteIcon(), func() {
+		idx := a.selectedPeerIndex
+		if idx < 0 || idx >= len(a.peerItems) {
+			return
+		}
+		p := a.peerItems[idx]
+		if err := a.knownPeers.Delete(p.ID); err != nil {
+			dialog.ShowError(err, a.window)
+			return
+		}
+		a.log("Forgot peer: " + p.Name)
+		a.updatePeersUI()
+	})
+	a.forgetBtn.Importance = widget.LowImportance
+
 	header := container.NewBorder(
 		nil, nil,
 		a.myInfoLabel,
-		container.NewHBox(a.refreshBtn),
+		container.NewHBox(a.forgetBtn, a.refreshBtn),
 	)
 
 	return container.NewBorder(
@@ -637,6 +698,17 @@ func (a *App) confirmDeployment() bool {
 	return <-result
 }
 
+func (a *App) promptHostKey(host, fp string) bool {
+	result := make(chan bool, 1)
+	fyne.Do(func() {
+		msg := fmt.Sprintf("Server: %s\n\nSSH host key fingerprint (SHA256):\n%s\n\nVerify this matches the server before accepting.", host, fp)
+		dialog.ShowConfirm("New SSH host key", msg, func(ok bool) {
+			result <- ok
+		}, a.window)
+	})
+	return <-result
+}
+
 func (a *App) deployServer() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -670,7 +742,7 @@ func (a *App) deployServer() {
 	defer fyne.Do(func() { a.deployBtn.Enable() })
 
 	a.log("→ SSH " + host + ":" + port)
-	d, err := ssh.NewDeployer(host, port, user, pass, a.log)
+	d, err := ssh.NewDeployer(host, port, user, pass, a.promptHostKey, a.log)
 	if err != nil {
 		a.log("SSH: " + err.Error())
 		fyne.Do(func() { dialog.ShowError(err, a.window) })
@@ -739,7 +811,7 @@ func (a *App) createClientForFriend() {
 	defer fyne.Do(func() { a.createClientBtn.Enable() })
 
 	a.log("→ Creating client " + name)
-	d, err := ssh.NewDeployer(host, port, user, pass, a.log)
+	d, err := ssh.NewDeployer(host, port, user, pass, a.promptHostKey, a.log)
 	if err != nil {
 		a.log("SSH: " + err.Error())
 		fyne.Do(func() { dialog.ShowError(err, a.window) })
@@ -835,7 +907,7 @@ func (a *App) connectVPN() {
 	fyne.Do(func() { a.connectBtn.Disable() })
 	a.log("Bringing up tunnel…")
 
-	c := &vpn.Client{TunName: "peerdrop", Cfg: a.clientConf}
+	c := &vpn.Client{TunName: "peerdrop", Cfg: a.clientConf, LogFn: a.log}
 	errCh := make(chan error, 1)
 	go func() {
 		defer func() {
@@ -860,7 +932,9 @@ func (a *App) connectVPN() {
 	a.log("VPN connected: " + a.clientConf.ClientIP() + " (" + a.myName + ")")
 
 	if err := a.startTransferAndDiscovery(); err != nil {
-		a.log("Services: " + err.Error())
+		a.log("Services failed: " + err.Error())
+		a.log("File transfer and peer discovery are disabled. Disconnect and try again.")
+		a.setStatus("VPN up, services failed")
 	}
 
 	fyne.Do(func() {
@@ -887,6 +961,7 @@ func (a *App) disconnectVPN() {
 		a.vpnClient = nil
 	}
 	a.peerItems = nil
+	a.selectedPeerIndex = -1
 	fyne.Do(func() {
 		a.peersList.Refresh()
 		a.peerSelect.Options = nil
@@ -900,6 +975,10 @@ func (a *App) disconnectVPN() {
 
 func (a *App) startTransferAndDiscovery() error {
 	srv, err := transfer.NewServer(
+		a.clientConf.ClientIP(),
+		a.myID,
+		a.e2eKeys,
+		a.knownPeers,
 		a.log,
 		func(hdr transfer.Header) bool { return a.askIncoming(hdr) },
 		func(hdr transfer.Header, path string) {
@@ -914,11 +993,14 @@ func (a *App) startTransferAndDiscovery() error {
 		return err
 	}
 	a.server = srv
-	a.log(fmt.Sprintf("TCP receive server on port %d", srv.Port()))
+	a.log(fmt.Sprintf("TCP receive server on %s:%d [E2E]",
+		a.clientConf.ClientIP(), srv.Port()))
 
 	d, err := peers.NewDiscovery(
 		a.myID, a.myName, srv.Port(),
 		a.clientConf.SubnetPrefix(),
+		a.e2eKeys,
+		a.knownPeers,
 		func(list []peers.Peer) { a.onPeersUpdate(list) },
 	)
 	if err != nil {
@@ -950,7 +1032,14 @@ func (a *App) showSecret(hdr transfer.Header) {
 
 		copyBtn := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
 			a.window.Clipboard().SetContent(hdr.Content)
-			a.log("Secret copied to clipboard")
+			a.log("Secret copied to clipboard (clears in 30s)")
+			time.AfterFunc(30*time.Second, func() {
+				fyne.Do(func() {
+					if a.window.Clipboard().Content() == hdr.Content {
+						a.window.Clipboard().SetContent("")
+					}
+				})
+			})
 		})
 		copyBtn.Importance = widget.HighImportance
 		row := container.NewHBox(copyBtn)
@@ -961,12 +1050,17 @@ func (a *App) showSecret(hdr transfer.Header) {
 					home, _ := os.UserHomeDir()
 					dir := filepath.Join(home, "Downloads", "PeerDrop")
 					_ = os.MkdirAll(dir, 0o755)
-					safeName := hdr.Name
+					safeName := sanitizeFilename(hdr.Name)
 					if safeName == "" {
 						safeName = "secret"
 					}
-					path := filepath.Join(dir, safeName+".txt")
-					if err := os.WriteFile(path, []byte(hdr.Content), 0o600); err != nil {
+					f, path, err := createUniqueFile(dir, safeName+".txt")
+					if err != nil {
+						dialog.ShowError(err, a.window)
+						return
+					}
+					defer f.Close()
+					if _, err := f.WriteString(hdr.Content); err != nil {
 						dialog.ShowError(err, a.window)
 						return
 					}
@@ -982,7 +1076,7 @@ func (a *App) showSecret(hdr transfer.Header) {
 			content,
 			row,
 			widget.NewSeparator(),
-			widget.NewLabel("Closing this window erases the secret from memory."),
+			widget.NewLabel("E2E-encrypted. Closing this window erases the secret from memory."),
 		)
 		d := dialog.NewCustom("Incoming secret", "Close", box, a.window)
 		d.Resize(fyne.NewSize(520, 380))
@@ -994,6 +1088,8 @@ func (a *App) onPeersUpdate(list []peers.Peer) {
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	a.peerItems = list
 	fyne.Do(func() {
+		a.selectedPeerIndex = -1
+		a.peersList.UnselectAll()
 		a.peersList.Refresh()
 
 		labels := make([]string, 0, len(list))
@@ -1045,18 +1141,23 @@ func (a *App) sendFile() {
 	})
 	defer fyne.Do(func() { a.sendFileBtn.Enable() })
 
-	a.log(fmt.Sprintf("Sending %s → %s", filepath.Base(path), p.Name))
+	a.log(fmt.Sprintf("Sending %s → %s [E2E]", filepath.Base(path), p.Name))
 
-	err := transfer.SendFile(p.IP, p.TCPPort, path, func(sent, total int64) {
-		if total > 0 {
-			v := float64(sent) / float64(total)
-			fyne.Do(func() {
-				a.progressBar.SetValue(v)
-				a.progressLabel.SetText(fmt.Sprintf("%d / %d bytes (%.1f%%)",
-					sent, total, v*100))
-			})
-		}
-	})
+	err := transfer.SendFile(
+		p.IP, p.TCPPort, p.ID,
+		a.myID, path,
+		a.e2eKeys, a.knownPeers,
+		func(sent, total int64) {
+			if total > 0 {
+				v := float64(sent) / float64(total)
+				fyne.Do(func() {
+					a.progressBar.SetValue(v)
+					a.progressLabel.SetText(fmt.Sprintf("%d / %d bytes (%.1f%%)",
+						sent, total, v*100))
+				})
+			}
+		},
+	)
 	if err != nil {
 		a.log("Error: " + err.Error())
 		fyne.Do(func() { dialog.ShowError(err, a.window) })
@@ -1067,7 +1168,7 @@ func (a *App) sendFile() {
 	fyne.Do(func() {
 		a.progressBar.SetValue(1)
 		a.progressLabel.SetText("Done")
-		dialog.ShowInformation("Success", "File sent", a.window)
+		dialog.ShowInformation("Success", "File sent (E2E-encrypted)", a.window)
 	})
 }
 
@@ -1090,8 +1191,8 @@ func (a *App) sendSecret() {
 	fyne.Do(func() { a.sendSecretBtn.Disable() })
 	defer fyne.Do(func() { a.sendSecretBtn.Enable() })
 
-	a.log(fmt.Sprintf("Secret \"%s\" → %s", name, p.Name))
-	if err := transfer.SendSecret(p.IP, p.TCPPort, name, content, a.secretAllowSave.Checked); err != nil {
+	a.log(fmt.Sprintf("Secret \"%s\" → %s [E2E]", name, p.Name))
+	if err := transfer.SendSecret(p.IP, p.TCPPort, p.ID, a.myID, name, content, a.secretAllowSave.Checked, a.e2eKeys, a.knownPeers); err != nil {
 		a.log("Error: " + err.Error())
 		fyne.Do(func() { dialog.ShowError(err, a.window) })
 		return
@@ -1099,10 +1200,38 @@ func (a *App) sendSecret() {
 	a.log("Secret sent")
 	fyne.Do(func() {
 		a.secretContent.SetText("")
-		dialog.ShowInformation("Success", "Secret sent", a.window)
+		dialog.ShowInformation("Success", "Secret sent (E2E-encrypted)", a.window)
 	})
 }
 
 func (a *App) Run() { a.window.ShowAndRun() }
 
-var _ = runtime.GOOS
+func sanitizeFilename(name string) string {
+	name = filepath.Base(name)
+	name = filepath.Clean(name)
+	if name == "." || name == ".." || name == "/" || name == "" {
+		return ""
+	}
+	return name
+}
+
+func createUniqueFile(dir, name string) (*os.File, string, error) {
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for i := 0; i < 10000; i++ {
+		var candidate string
+		if i == 0 {
+			candidate = filepath.Join(dir, name)
+		} else {
+			candidate = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, i, ext))
+		}
+		f, err := os.OpenFile(candidate, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			return f, candidate, nil
+		}
+		if !os.IsExist(err) {
+			return nil, "", err
+		}
+	}
+	return nil, "", fmt.Errorf("could not find unique name for %q", name)
+}
